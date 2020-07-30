@@ -704,8 +704,6 @@ def _rand_1_gating(
     inputs, outer_expert_dims, experts_dim, expert_capacity_dim,
     hparams, train, variable_dtype, importance=None, name="rand_1_gating"):
   """Compute a random top-1 gating."""
-  del importance
-
   # SELECT EXPERT
   if train:
     policy = hparams.moe_rand_1_policy_train
@@ -740,8 +738,14 @@ def _rand_1_gating(
   group_size_dim = inputs.shape[-2]
   density_1 = mtf.reduce_mean(expert_mask, reduced_dim=group_size_dim)
   density_1_proxy = mtf.reduce_mean(raw_gates, reduced_dim=group_size_dim)
-  loss = (mtf.reduce_mean(density_1_proxy * density_1)
-          * float(experts_dim.size * experts_dim.size))
+  if importance is not None:
+    expert_mask *= mtf.cast(mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+    expert_gate *= mtf.cast(mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+    density_1_proxy *= mtf.cast(
+        mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+  loss = (
+      mtf.reduce_mean(density_1_proxy * density_1) *
+      float(experts_dim.size * experts_dim.size))
 
   # Logging
   if train:
@@ -767,10 +771,12 @@ def _rand_1_gating(
   # the batch indices, to each expert, with position_in_expert
   position_in_expert = mtf.cumsum(
       expert_mask, group_size_dim, exclusive=True) * expert_mask
+  position_in_expert = mtf.cast(position_in_expert, dtype=raw_gates.dtype)
   # Keep only tokens that fit within expert_capacity.
   expert_capacity_float = float(expert_capacity_dim.size)
-  expert_mask *= mtf.to_float(mtf.less(position_in_expert,
-                                       expert_capacity_float))
+  expert_mask *= mtf.cast(
+      mtf.less(position_in_expert, expert_capacity_float),
+      dtype=raw_gates.dtype)
   expert_mask_flat = mtf.reduce_sum(expert_mask, reduced_dim=experts_dim)
 
   # Mask out the experts that have overflowed expert capacity. Sparsify the
@@ -778,9 +784,12 @@ def _rand_1_gating(
   expert_gate *= expert_mask_flat
 
   combine_tensor = (
-      expert_gate * expert_mask_flat
-      * mtf.one_hot(expert_index, experts_dim)
-      * mtf.one_hot(mtf.to_int32(position_in_expert), expert_capacity_dim))
+      expert_gate * expert_mask_flat *
+      mtf.one_hot(expert_index, experts_dim, dtype=raw_gates.dtype) *
+      mtf.one_hot(
+          mtf.to_int32(position_in_expert),
+          expert_capacity_dim,
+          dtype=raw_gates.dtype))
 
   # Match the inputs dtype.
   combine_tensor = mtf.cast(combine_tensor, inputs.dtype)
