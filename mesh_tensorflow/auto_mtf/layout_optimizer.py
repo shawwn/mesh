@@ -38,7 +38,6 @@ from absl import logging
 from mesh_tensorflow.auto_mtf import print_cp_model_solution
 from mesh_tensorflow.auto_mtf import scheduler
 import six
-from ortools.sat.python import cp_model
 
 
 class SolverError(Exception):
@@ -117,6 +116,7 @@ class LayoutOptimizer(object):
     self._memory_contents = None  # [frozenset(string)]
 
     # Initialize the model.
+    from ortools.sat.python import cp_model
     self._model = cp_model.CpModel()
 
     self._preprocess_input()

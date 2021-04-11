@@ -24,7 +24,6 @@ import mesh_tensorflow as mtf
 from mesh_tensorflow.transformer import vocab_embeddings
 import mock
 import numpy as np
-import scipy.misc
 import tensorflow.compat.v1 as tf
 
 
@@ -380,6 +379,7 @@ class MixtureOfSoftmaxesTest(tf.test.TestCase):
     self.evaluate(lowering.copy_masters_to_slices())
     actual, = self.evaluate([actual_logits])
 
+    import scipy.misc
     expected_priors = scipy.special.softmax([1, 3])
     expected_probs_1 = scipy.special.softmax(np.tanh([1, 1, 2, 2]))
     expected_probs_2 = scipy.special.softmax(np.tanh([2, 1, 1, 1]))

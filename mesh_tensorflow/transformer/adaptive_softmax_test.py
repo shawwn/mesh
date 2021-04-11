@@ -24,7 +24,6 @@ import mesh_tensorflow as mtf
 from mesh_tensorflow.transformer import adaptive_softmax
 import mock
 import numpy as np
-import scipy.special
 import tensorflow.compat.v1 as tf
 
 
@@ -43,6 +42,7 @@ def initialize_by_shape(shape_to_value):
 
 
 def _log_softmax(logits):
+  import scipy.special
   log_z = scipy.special.logsumexp(logits)
   return logits - log_z
 
