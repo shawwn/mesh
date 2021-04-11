@@ -62,12 +62,15 @@ class BalancedVariablePlacer(object):
     shape = tf.TensorShape(var.get_attr('shape'))
     assert shape.num_elements() is not None
 
-    size = var.get_attr('dtype').size
+    dtype = var.get_attr('dtype')
+    size = dtype.size
     mem, device = heapq.heappop(self._mem_device_heap)
     mem += shape.num_elements() * size
     heapq.heappush(self._mem_device_heap, (mem, device))
-    tf.logging.debug('Place variable {} on {} and consumes {} Bytes.'.format(
-        var.name, device, mem))
+    # tf.logging.debug('Place variable {} on {} and consumes {} Bytes.'.format(
+    #     var.name, device, mem))
+    tf.logging.debug('Place variable {} shape={} dtype={} on {} and consumes {} Bytes.'.format(
+      var.name, shape.as_list(), dtype, device, mem))
     self._last_device = device
 
     return device

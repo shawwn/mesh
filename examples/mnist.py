@@ -26,15 +26,24 @@ import mesh_tensorflow as mtf
 import mnist_dataset as dataset  # local file import
 import tensorflow.compat.v1 as tf
 
+from tensorflow.core.protobuf import rewriter_config_pb2  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.tpu import tpu_config  # pylint: disable=g-direct-tensorflow-import
-from tensorflow.python.tpu import tpu_estimator  # pylint: disable=g-direct-tensorflow-import
+#from tensorflow.python.tpu import tpu_estimator  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.tpu import tpu
 
+from tensorflow_estimator.python.estimator.tpu import tpu_estimator
+from tensorflow_estimator.python.estimator import estimator as estimator_lib
+
 import six
+import mock
 
 
 tf.flags.DEFINE_string("data_dir", "/tmp/mnist_data",
                        "Path to directory containing the MNIST dataset")
+tf.flags.DEFINE_integer("data_train_size", 60000,
+                        "Number of examples in the MNIST training dataset.")
+tf.flags.DEFINE_integer("data_eval_size", 10000,
+                        "Number of examples in the MNIST validation dataset.")
 tf.flags.DEFINE_string("model_dir", "/tmp/mnist_model", "Estimator model_dir")
 tf.flags.DEFINE_integer("batch_size", 200,
                         "Mini-batch size for the training. Note that this "
@@ -42,7 +51,7 @@ tf.flags.DEFINE_integer("batch_size", 200,
 tf.flags.DEFINE_integer("hidden_size", 512, "Size of each hidden layer.")
 tf.flags.DEFINE_integer("train_epochs", 40, "Total number of training epochs.")
 
-tf.flags.DEFINE_integer('iterations', 100,
+tf.flags.DEFINE_integer('iterations', -1,
                         'Number of iterations per training loop.')
 
 tf.flags.DEFINE_integer("epochs_between_evals", 1,
@@ -50,8 +59,8 @@ tf.flags.DEFINE_integer("epochs_between_evals", 1,
 tf.flags.DEFINE_integer("eval_steps", 0,
                         "Total number of evaluation steps. If `0`, evaluation "
                         "after training is skipped.")
-tf.flags.DEFINE_string("mesh_shape", "b1:2;b2:2", "mesh shape")
-tf.flags.DEFINE_string("layout", "row_blocks:b1;col_blocks:b2",
+tf.flags.DEFINE_string("mesh_shape", "b0:2;b1:2;b2:2", "mesh shape")
+tf.flags.DEFINE_string("layout", "batch:b0;row_blocks:b1;col_blocks:b2",
                        "layout rules")
 
 # Cloud TPU Cluster Resolvers
@@ -148,7 +157,7 @@ def mnist_model(image, labels, mesh):
   one_channel_dim = mtf.Dimension("one_channel", 1)
 
   x = mtf.import_tf_tensor(
-      mesh, tf.reshape(image, [FLAGS.batch_size, 4, 7, 4, 7, 1]),
+      mesh, image, #tf.reshape(image, [FLAGS.batch_size, 4, 7, 4, 7, 1]),
       mtf.Shape(
           [batch_dim, row_blocks_dim, rows_dim,
            col_blocks_dim, cols_dim, one_channel_dim]))
@@ -183,7 +192,8 @@ def mnist_model(image, labels, mesh):
     loss = None
   else:
     labels = mtf.import_tf_tensor(
-        mesh, tf.reshape(labels, [FLAGS.batch_size]), mtf.Shape([batch_dim]))
+        mesh, labels, #tf.reshape(labels, [FLAGS.batch_size]),
+        mtf.Shape([batch_dim]))
     loss = mtf.layers.softmax_cross_entropy_with_logits(
         logits, mtf.one_hot(labels, classes_dim), classes_dim)
     loss = mtf.reduce_mean(loss)
@@ -192,174 +202,208 @@ def mnist_model(image, labels, mesh):
 
 def model_fn(features, labels, mode, params):
   """The model_fn argument for creating an Estimator."""
+  #with mtf.utils.outside_all_rewrites():
+  if True:
 
-  scalars = {}
+    scalars = {}
 
 
-  def _add_summary(lowering, train_or_eval, tf_loss, scalars, global_step):
-    """Add all summaries."""
-    for k in scalars.keys():
-      if not isinstance(scalars[k], tf.Tensor):
-        scalars[k] = tf.cast(
-            lowering.export_to_tf_tensor(scalars[k]), tf.float32)
+    def _add_summary(lowering, train_or_eval, tf_loss, scalars, global_step):
+      """Add all summaries."""
+      for k in scalars.keys():
+        if not isinstance(scalars[k], tf.Tensor):
+          scalars[k] = tf.cast(
+              lowering.export_to_tf_tensor(scalars[k]), tf.float32)
 
-    def _host_loss_summary(global_step, tf_loss, **scalars):
-      """Add summary.scalar in host side."""
-      gs = tf.cast(global_step, tf.int64)
-      sum_loss = contrib_summary_scalar(
-          '{}_loss'.format(train_or_eval), tf_loss, step=gs)
-      sum_ops = [sum_loss.op]
-      for description, tf_metric in six.iteritems(scalars):
-        sum_metric = contrib_summary_scalar(
-            '{}_{}'.format(train_or_eval, description), tf_metric, step=gs)
-        sum_ops.append(sum_metric)
-      with tf.control_dependencies(sum_ops):
-        return tf.identity(tf_loss)
+      def _host_loss_summary(global_step, tf_loss, **scalars):
+        """Add summary.scalar in host side."""
+        gs = tf.cast(global_step, tf.int64)
+        sum_loss = contrib_summary_scalar(
+            '{}_loss'.format(train_or_eval), tf_loss, step=gs)
+        sum_ops = [sum_loss.op]
+        for description, tf_metric in six.iteritems(scalars):
+          sum_metric = contrib_summary_scalar(
+              '{}_{}'.format(train_or_eval, description), tf_metric, step=gs)
+          sum_ops.append(sum_metric)
+        with tf.control_dependencies(sum_ops):
+          return tf.identity(tf_loss)
+
+      if use_tpu():
+        # Cast the global step to tf.int32, since
+        # outside_compilation does not support tf.int64.
+        tf_loss = tpu.outside_compilation(
+            _host_loss_summary,
+            tf.cast(global_step, tf.int32),
+            tf_loss,
+            **scalars)
+      else:
+        tf_loss = _host_loss_summary(
+            tf.cast(global_step, tf.int32),
+            tf_loss,
+            **scalars)
+
+      return tf_loss
+
+
+    tf.logging.info("features = %s labels = %s mode = %s params=%s" %
+                    (features, labels, mode, params))
+    global_step = tf.train.get_global_step()
+    graph = mtf.Graph()
+    mesh_shape = mtf.convert_to_shape(FLAGS.mesh_shape)
+    layout_rules = mtf.convert_to_layout_rules(FLAGS.layout)
+    # mesh_size = mesh_shape.size
+    # mesh_devices = [""] * mesh_size
+    # mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
+    #     mesh_shape, layout_rules, mesh_devices)
 
     if use_tpu():
-      # Cast the global step to tf.int32, since
-      # outside_compilation does not support tf.int64.
-      tf_loss = tpu.outside_compilation(
-          _host_loss_summary,
-          tf.cast(global_step, tf.int32),
-          tf_loss,
-          **scalars)
+      ctx = params['context']
+      num_hosts = ctx.num_hosts
+      host_placement_fn = ctx.tpu_host_placement_function
+      device_list = [host_placement_fn(host_id=t) for t in range(num_hosts)]
+      tf.logging.info('device_list = %s' % device_list,)
+      # TODO(ylc): Better estimation of replica cache size?
+      replica_cache_size = 300 * 1000000  # 300M per replica
+      # Worker 0 caches all the TPU binaries.
+      worker0_mem = replica_cache_size * ctx.num_replicas
+      devices_memeory_usage = [worker0_mem] + [0] * (num_hosts - 1)
+      var_placer = mtf.utils.BalancedVariablePlacer(device_list,
+                                                    devices_memeory_usage)
+      mesh_devices = [''] * mesh_shape.size
+      mesh_impl = mtf.simd_mesh_impl.SimdMeshImpl(
+          mesh_shape, layout_rules, mesh_devices, ctx.device_assignment)
     else:
-      tf_loss = _host_loss_summary(
-          tf.cast(global_step, tf.int32),
-          tf_loss,
-          **scalars)
-
-    return tf_loss
-
-
-  tf.logging.info("features = %s labels = %s mode = %s params=%s" %
-                  (features, labels, mode, params))
-  global_step = tf.train.get_global_step()
-  mesh_shape = mtf.convert_to_shape(FLAGS.mesh_shape)
-  layout_rules = mtf.convert_to_layout_rules(FLAGS.layout)
-  # mesh_size = mesh_shape.size
-  # mesh_devices = [""] * mesh_size
-  # mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
-  #     mesh_shape, layout_rules, mesh_devices)
-
-  if use_tpu():
-    ctx = params['context']
-    num_hosts = ctx.num_hosts
-    host_placement_fn = ctx.tpu_host_placement_function
-    device_list = [host_placement_fn(host_id=t) for t in range(num_hosts)]
-    tf.logging.info('device_list = %s' % device_list,)
-    # TODO(ylc): Better estimation of replica cache size?
-    replica_cache_size = 300 * 1000000  # 300M per replica
-    # Worker 0 caches all the TPU binaries.
-    worker0_mem = replica_cache_size * ctx.num_replicas
-    devices_memeory_usage = [worker0_mem] + [0] * (num_hosts - 1)
-    var_placer = mtf.utils.BalancedVariablePlacer(device_list,
-                                                  devices_memeory_usage)
-    mesh_devices = [''] * mesh_shape.size
-    mesh_impl = mtf.simd_mesh_impl.SimdMeshImpl(
-        mesh_shape, layout_rules, mesh_devices, ctx.device_assignment)
-  else:
-    var_placer = None
-    mesh_devices = [''] * mesh_shape.size
-    mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
-        mesh_shape, layout_rules, mesh_devices)
-  graph = mtf.Graph()
-  #mesh = mtf.Mesh(graph, "my_mesh")
-  mesh = mtf.Mesh(graph, 'my_mesh', var_placer)
-  logits, loss = mnist_model(features, labels, mesh)
-  
-
-  if mode == tf.estimator.ModeKeys.TRAIN:
-    var_grads = mtf.gradients(
-        [loss], [v.outputs[0] for v in graph.trainable_variables])
-    optimizer = mtf.optimize.AdafactorOptimizer()
-    update_ops = optimizer.apply_grads(var_grads, graph.trainable_variables)
-
-  lowering = mtf.Lowering(graph, {mesh: mesh_impl})
-  master_to_slice_hook = mtf.MtfRestoreHook(lowering)
-
-  train_or_eval='train' if mode == tf.estimator.ModeKeys.TRAIN else 'eval'
-
-  tf_logits = lowering.export_to_tf_tensor(logits)
-  if mode != tf.estimator.ModeKeys.PREDICT:
-    tf_loss = lowering.export_to_tf_tensor(loss)
-    #tf.summary.scalar("loss", tf_loss)
-    # tf_loss = _add_summary(
-    #     lowering, train_or_eval, tf_loss, scalars, global_step)
+      var_placer = None
+      mesh_devices = [''] * mesh_shape.size
+      mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
+          mesh_shape, layout_rules, mesh_devices)
+    #mesh = mtf.Mesh(graph, "my_mesh")
+    mesh = mtf.Mesh(graph, 'my_mesh', var_placer)
+    with mtf.utils.outside_all_rewrites():
+      # Do not tpu_rewrite this part. Inside this unet, If you use Tensorflow,
+      # instead of Mesh-Tensorflor, it will cause host to tpu send/rec.
+      logits, loss = mnist_model(features, labels, mesh)
     
 
-  if mode == tf.estimator.ModeKeys.TRAIN:
-    tf_update_ops = [lowering.lowered_operation(op) for op in update_ops]
-    tf_update_ops.append(tf.assign_add(global_step, 1))
-    train_op = tf.group(tf_update_ops)
-    saver = tf.train.Saver(
-        tf.global_variables(),
-        sharded=True,
-        max_to_keep=10,
-        keep_checkpoint_every_n_hours=2,
-        defer_build=False, save_relative_paths=True)
-    tf.add_to_collection(tf.GraphKeys.SAVERS, saver)
-    saver_listener = mtf.MtfCheckpointSaverListener(lowering)
-    slice_to_master_hook = tf.train.CheckpointSaverHook(
-        FLAGS.model_dir,
-        save_steps=1000,
-        saver=saver,
-        listeners=[saver_listener])
+    if mode == tf.estimator.ModeKeys.TRAIN:
+      var_grads = mtf.gradients(
+          [loss], [v.outputs[0] for v in graph.trainable_variables])
+      optimizer = mtf.optimize.AdafactorOptimizer()
+      update_ops = optimizer.apply_grads(var_grads, graph.trainable_variables)
 
-    accuracy = tf.metrics.accuracy(
-        labels=labels, predictions=tf.argmax(tf_logits, axis=1))
+    lowering = mtf.Lowering(graph, {mesh: mesh_impl})
 
-    # Name tensors to be logged with LoggingTensorHook.
-    tf.identity(tf_loss, "cross_entropy")
-    tf.identity(accuracy[1], name="train_accuracy")
+    train_or_eval='train' if mode == tf.estimator.ModeKeys.TRAIN else 'eval'
 
-    # Save accuracy scalar to Tensorboard output.
-    #tf.summary.scalar("train_accuracy", accuracy[1])
-    scalars['train_accuracy'] = accuracy[1]
-    tf_loss = _add_summary(
-        lowering, train_or_eval, tf_loss, scalars, global_step)
+    if mode != tf.estimator.ModeKeys.PREDICT:
+      tf_loss = lowering.export_to_tf_tensor(loss)
+      #tf.summary.scalar("loss", tf_loss)
+      # tf_loss = _add_summary(
+      #     lowering, train_or_eval, tf_loss, scalars, global_step)
+    else:
+      # for now, we can only export fully-replicated tensors.
+      fully_replicated_logits = mtf.anonymize(logits)
+      
+      tf_logits = lowering.export_to_tf_tensor(fully_replicated_logits)
+      
 
-    # master_to_slice_hook must come before slice_to_master_hook
-    return tf.estimator.EstimatorSpec(
-        tf.estimator.ModeKeys.TRAIN, loss=tf_loss, train_op=train_op,
-        **{'training_hooks' if use_tpu() else 'training_chief_hooks':
-          [master_to_slice_hook, slice_to_master_hook]})
+    if mode == tf.estimator.ModeKeys.TRAIN:
+      tf_update_ops = [lowering.lowered_operation(op) for op in update_ops]
+      tf_update_ops.append(tf.assign_add(global_step, 1))
+      train_op = tf.group(tf_update_ops)
 
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    predictions = {
-        "classes": tf.argmax(tf_logits, axis=1),
-        "probabilities": tf.nn.softmax(tf_logits),
-    }
-    return tf.estimator.EstimatorSpec(
-        mode=tf.estimator.ModeKeys.PREDICT,
-        predictions=predictions,
-        prediction_hooks=[master_to_slice_hook],
-        export_outputs={
-            "classify": tf.estimator.export.PredictOutput(predictions)
-        })
-  if mode == tf.estimator.ModeKeys.EVAL:
-    tf_loss = _add_summary(
-        lowering, train_or_eval, tf_loss, scalars, global_step)
-    return tf.estimator.EstimatorSpec(
-        mode=tf.estimator.ModeKeys.EVAL,
-        loss=tf_loss,
-        evaluation_hooks=[master_to_slice_hook],
-        eval_metric_ops={
-            "accuracy":
-            tf.metrics.accuracy(
-                labels=labels, predictions=tf.argmax(tf_logits, axis=1)),
-        })
+    with mtf.utils.outside_all_rewrites():
+      master_to_slice_hook = mtf.MtfRestoreHook(lowering)
+      if mode == tf.estimator.ModeKeys.TRAIN:
+
+        saver = tf.train.Saver(
+            tf.global_variables(),
+            keep_checkpoint_every_n_hours=2,
+            save_relative_paths=True)
+            # sharded=True,
+            # max_to_keep=10,
+            # keep_checkpoint_every_n_hours=2,
+            # defer_build=False, save_relative_paths=True)
+        tf.add_to_collection(tf.GraphKeys.SAVERS, saver)
+        saver_listener = mtf.MtfCheckpointSaverListener(lowering)
+        slice_to_master_hook = tf.train.CheckpointSaverHook(
+            FLAGS.model_dir,
+            save_steps=1000,
+            saver=saver,
+            listeners=[saver_listener])
+
+        if False:
+          accuracy = tf.metrics.accuracy(
+              labels=labels, predictions=tf.argmax(tf_logits, axis=1))
+
+          # Name tensors to be logged with LoggingTensorHook.
+          tf.identity(tf_loss, "cross_entropy")
+          tf.identity(accuracy[1], name="train_accuracy")
+
+          # Save accuracy scalar to Tensorboard output.
+          #tf.summary.scalar("train_accuracy", accuracy[1])
+          scalars['train_accuracy'] = accuracy[1]
+          tf_loss = _add_summary(
+              lowering, train_or_eval, tf_loss, scalars, global_step)
+
+        # master_to_slice_hook must come before slice_to_master_hook
+        if use_tpu():
+          return tpu_estimator.TPUEstimatorSpec(
+              tf.estimator.ModeKeys.TRAIN, loss=tf_loss, train_op=train_op,
+              training_hooks=[master_to_slice_hook, slice_to_master_hook, tf.train.StepCounterHook(every_n_steps=10)])
+        else:
+          return tf.estimator.EstimatorSpec(
+              tf.estimator.ModeKeys.TRAIN, loss=tf_loss, train_op=train_op,
+              training_chief_hooks=[master_to_slice_hook, slice_to_master_hook, tf.train.StepCounterHook(every_n_steps=10)])
+
+      if mode == tf.estimator.ModeKeys.PREDICT:
+        predictions = {
+            "classes": tf.argmax(tf_logits, axis=1),
+            "probabilities": tf.nn.softmax(tf_logits),
+        }
+        assert not use_tpu()
+        return tf.estimator.EstimatorSpec(
+            mode=tf.estimator.ModeKeys.PREDICT,
+            predictions=predictions,
+            prediction_hooks=[master_to_slice_hook],
+            export_outputs={
+                "classify": tf.estimator.export.PredictOutput(predictions)
+            })
+      if mode == tf.estimator.ModeKeys.EVAL:
+        tf_loss = _add_summary(
+            lowering, train_or_eval, tf_loss, scalars, global_step)
+        assert not use_tpu()
+        return tf.estimator.EstimatorSpec(
+            mode=tf.estimator.ModeKeys.EVAL,
+            loss=tf_loss,
+            evaluation_hooks=[master_to_slice_hook],
+            eval_metric_ops={
+                "accuracy":
+                tf.metrics.accuracy(
+                    labels=labels, predictions=tf.argmax(tf_logits, axis=1)),
+            })
 
 
 def run_mnist():
   """Run MNIST training and eval loop."""
+  session_config = None
+  if use_tpu():
+    # meta-optimizer drastically slows down startup time and has little benefit
+    # when running on TPU.
+    session_config = tf.ConfigProto(
+        graph_options=tf.GraphOptions(
+            rewrite_options=rewriter_config_pb2.RewriterConfig(
+                disable_meta_optimizer=True)))
+
   if use_tpu():
     tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
         FLAGS.tpu, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
     iterations_per_loop = FLAGS.iterations
+    if iterations_per_loop <= 0:
+      iterations_per_loop = FLAGS.data_train_size // FLAGS.batch_size
+    tf.logging.info("iterations_per_loop=%s" % iterations_per_loop)
     mesh_shape = mtf.convert_to_shape(FLAGS.mesh_shape)
+    
     config = tpu_config.RunConfig(
         cluster=tpu_cluster_resolver,
         model_dir=FLAGS.model_dir,
@@ -367,10 +411,12 @@ def run_mnist():
         save_checkpoints_secs=None,  # Disable the default saver
         log_step_count_steps=iterations_per_loop,
         save_summary_steps=iterations_per_loop,
+        session_config=session_config,
         tpu_config=tpu_config.TPUConfig(
             num_shards=mesh_shape.size,
             iterations_per_loop=iterations_per_loop,
-            num_cores_per_replica=8 // mesh_shape.size,
+            #num_cores_per_replica=8 // mesh_shape.size,
+            num_cores_per_replica=1,
             per_host_input_for_training=tpu_config.InputPipelineConfig.BROADCAST))
     mnist_classifier = tpu_estimator.TPUEstimator(
         use_tpu=True,
@@ -395,6 +441,11 @@ def run_mnist():
         model_fn=model_fn,
         model_dir=FLAGS.model_dir)
 
+  current_step = estimator_lib._load_global_step_from_checkpoint_dir(FLAGS.model_dir)  # pylint: disable=protected-access,line-too-long
+  current_epoch = current_step // iterations_per_loop
+  tf.logging.info('Current step %d epoch %d', current_step, current_epoch)
+
+
   # Set up training and evaluation input functions.
   def train_input_fn(params=None):
     """Prepare data for training."""
@@ -405,39 +456,93 @@ def run_mnist():
     # randomness, while smaller sizes use less memory. MNIST is a small
     # enough dataset that we can easily shuffle the full epoch.
     ds = dataset.train(FLAGS.data_dir)
-    ds_batched = ds.cache().shuffle(buffer_size=50000).batch(batch_size)
-    ds_batched = ds_batched.map(lambda features, labels, batch_size=batch_size: (features.set_shape([batch_size, features.shape[-1]]) or labels.set_shape([batch_size]) or (features, labels)))
+    ds_batched = ds.cache().shuffle(buffer_size=50000).batch(batch_size, drop_remainder=True)
+    ds_batched = ds_batched.map(lambda features, labels, batch_size=batch_size: (features.set_shape([batch_size, features.shape[-1]]) or labels.set_shape([batch_size]) or (tf.reshape(features, [batch_size, 4, 7, 4, 7, 1]), labels)))
+    #tf.reshape(image, [FLAGS.batch_size, 4, 7, 4, 7, 1])
 
     # Iterate through the dataset a set number (`epochs_between_evals`) of times
     # during each training session.
     ds = ds_batched.repeat(FLAGS.epochs_between_evals)
+    #ds = ds_batched.repeat()
     return ds
 
   def eval_input_fn(params=None):
     batch_size = params['batch_size'] if params is not None else FLAGS.batch_size
     return dataset.test(FLAGS.data_dir).batch(
-        batch_size).make_one_shot_iterator().get_next()
+        batch_size, drop_remainder=True).make_one_shot_iterator().get_next()
 
+  import tqdm
   if use_tpu():
     # Train and evaluate model.
-    import tqdm
-    for epoch in tqdm.trange(FLAGS.train_epochs):
+    # import tqdm
+    # for epoch in tqdm.trange(FLAGS.train_epochs):
+    #if True:
+    for _ in tqdm.trange(current_epoch, FLAGS.train_epochs // FLAGS.epochs_between_evals):
       # eval_results = mnist_classifier.evaluate(input_fn=eval_input_fn)
       # print("\nEvaluation results:\n\t%s\n" % eval_results)
-      mnist_classifier.train(input_fn=train_input_fn, hooks=None, steps=FLAGS.iterations)
+      #mnist_classifier.train(input_fn=train_input_fn, max_steps=FLAGS.iterations)
+      mnist_classifier.train(input_fn=train_input_fn, steps=iterations_per_loop)
   else:
     # Train and evaluate model.
-    for _ in range(FLAGS.train_epochs // FLAGS.epochs_between_evals):
+    for _ in tqdm.trange(current_epoch, FLAGS.train_epochs // FLAGS.epochs_between_evals):
       mnist_classifier.train(input_fn=train_input_fn, hooks=None)
       eval_results = mnist_classifier.evaluate(input_fn=eval_input_fn)
       print("\nEvaluation results:\n\t%s\n" % eval_results)
 
 
+
+E = tpu_estimator
+
+def _train_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn):
+  """Executes `model_fn_wrapper` multiple times on all TPU shards."""
+  iterations_per_loop_var = E._create_or_get_iterations_per_loop()
+
+  (single_tpu_train_step, host_call, captured_scaffold_fn,
+   captured_training_hooks) = (
+       model_fn_wrapper.convert_to_single_tpu_train_step(dequeue_fn))
+
+  @E.tpu_function.on_device_training_loop
+  def multi_tpu_train_steps_on_single_shard(replica_id):
+    # `tpu.split_compile_and_shard()` splits and passes input for each
+    # replica as an array. As so, correctly reshape the input to be a
+    # scalar.
+    replica_id = tf.reshape(replica_id, [])
+    with E.tpu_context._TPUEstimatorReplicaContext(replica_id):  # pylint: disable=protected-access
+      # outputs = training_loop.while_loop(
+      #     lambda i, loss: i < iterations_per_loop_var,
+      #     lambda i, loss: [i + 1, single_tpu_train_step(i)],
+      #     inputs=[0, _INITIAL_LOSS])
+      # return outputs[1:]
+      return single_tpu_train_step(0)
+
+  # Add input that represents id for each replica in sync so that
+  # _TPUEstimatorReplicaContext can be correctly entered during
+  # replicated computation.
+  replica_id_inputs = []
+  replica_id_inputs.append([tf.constant(i) for i in range(ctx.num_replicas)])
+
+  (compile_op, loss) = E.tpu.split_compile_and_shard(
+      multi_tpu_train_steps_on_single_shard,
+      inputs=replica_id_inputs,
+      num_shards=ctx.num_replicas,
+      outputs_from_all_shards=False,
+      device_assignment=ctx.device_assignment)
+
+  loss = loss[0]
+  return (compile_op, loss, host_call, captured_scaffold_fn,
+          captured_training_hooks.get())
+
+
+
 def main(_):
-  run_mnist()
+  #with mock.patch.object(tf, "glorot_uniform_initializer", mock_initializer):
+  #with mock.patch.object(tpu_estimator, "_train_on_tpu_system", _train_on_tpu_system):
+  if True:
+    run_mnist()
 
 
 if __name__ == "__main__":
   tf.disable_v2_behavior()
   tf.logging.set_verbosity(tf.logging.DEBUG)
+  tf.get_logger().setLevel('DEBUG')
   tf.app.run()

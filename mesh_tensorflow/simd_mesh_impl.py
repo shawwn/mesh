@@ -188,7 +188,20 @@ class SimdMeshImpl(mtf.MeshImpl):
               name=slice_var_name,
               expected_shape=slice_shape)
 
-        slices.append(slice_var)
+        def log_info(var):
+          shape = tf.TensorShape(var.shape)
+          assert shape.num_elements() is not None
+
+          size = var.dtype.size
+          #mem, device = heapq.heappop(self._mem_device_heap)
+          device = mesh_impl.device_assignment.tpu_device(replica=physical_pnum)
+          mem = shape.num_elements() * size
+
+          tf.logging.debug('Place slice variable {} shape={} dtype={} on {} and consumes {} Bytes.'.format(
+            var.name, shape.as_list(), var.dtype, device, mem))
+          return var
+
+        slices.append(log_info(slice_var))
 
       # Restore the initial stack
       tf.get_default_graph()._device_function_stack = init_device_stack
