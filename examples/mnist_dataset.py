@@ -91,20 +91,33 @@ def download(directory, filename):
   os.remove(zipped_filepath)
   return filepath
 
+from functools import partial
 
-def dataset(directory, images_file, labels_file):
+def _get_null_input(data, dtype):
+  del data
+  image = tf.zeros([784], dtype)
+  label = tf.zeros([], tf.int32)
+  return image, label
+
+def dataset(directory=None, images_file=None, labels_file=None, dtype=tf.float32):
   """Download and parse MNIST dataset."""
 
+  if directory is None or len(directory) <= 0:
+    tf.logging.info('Undefined data_dir implies null input')
+    return tf.data.Dataset.range(1).repeat().map(partial(_get_null_input, dtype=dtype), num_parallel_calls=300)
+
+  assert images_file is not None
+  assert labels_file is not None
   images_file = download(directory, images_file)
   labels_file = download(directory, labels_file)
 
-  check_image_file_header(images_file)
-  check_labels_file_header(labels_file)
+  # check_image_file_header(images_file)
+  # check_labels_file_header(labels_file)
 
   def decode_image(image):
     # Normalize from [0, 255] to [0.0, 1.0]
     image = tf.decode_raw(image, tf.uint8)
-    image = tf.cast(image, tf.float32)
+    image = tf.cast(image, dtype)
     image = tf.reshape(image, [784])
     return image / 255.0
 

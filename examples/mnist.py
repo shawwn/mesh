@@ -45,16 +45,16 @@ tf.flags.DEFINE_integer("data_train_size", 60000,
 tf.flags.DEFINE_integer("data_eval_size", 10000,
                         "Number of examples in the MNIST validation dataset.")
 tf.flags.DEFINE_string("model_dir", "/tmp/mnist_model", "Estimator model_dir")
-tf.flags.DEFINE_integer("batch_size", 200,
+tf.flags.DEFINE_integer("batch_size", 2560, #200,
                         "Mini-batch size for the training. Note that this "
                         "is the global batch size and not the per-shard batch.")
 tf.flags.DEFINE_integer("hidden_size", 512, "Size of each hidden layer.")
-tf.flags.DEFINE_integer("train_epochs", 40, "Total number of training epochs.")
+tf.flags.DEFINE_integer("train_epochs", 40000, "Total number of training epochs.")
 
 tf.flags.DEFINE_integer('iterations', -1,
                         'Number of iterations per training loop.')
 
-tf.flags.DEFINE_integer("epochs_between_evals", 1,
+tf.flags.DEFINE_integer("epochs_between_evals", 1000,
                         "# of epochs between evaluations.")
 tf.flags.DEFINE_integer("eval_steps", 0,
                         "Total number of evaluation steps. If `0`, evaluation "
@@ -69,6 +69,9 @@ tf.flags.DEFINE_string(
     default=None,
     help='The Cloud TPU to use for training. This should be either the name '
     'used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 url.')
+
+tf.flags.DEFINE_integer("tpu_cores", 8,
+                        "Total number of TPU cores.")
 
 tf.flags.DEFINE_string(
     'gcp_project',
@@ -134,6 +137,13 @@ class _CkptLoaderHook(tf.estimator.SessionRunHook):
       if check_point:
         saver.restore(session, check_point)
 
+def idiv(a, b, warn=False):
+  if warn:
+    if a % b != 0:
+      tf.logging.info("WARNING: {} % {} != 0".format(a, b))
+  else:
+    assert a % b == 0
+  return a // b
 
 def mnist_model(image, labels, mesh):
   """The model.
@@ -148,6 +158,7 @@ def mnist_model(image, labels, mesh):
     loss: a mtf.Tensor with shape []
   """
   batch_dim = mtf.Dimension("batch", FLAGS.batch_size)
+  #batch_dim = mtf.Dimension("batch", idiv(FLAGS.batch_size, FLAGS.tpu_cores))
   row_blocks_dim = mtf.Dimension("row_blocks", 4)
   col_blocks_dim = mtf.Dimension("col_blocks", 4)
   rows_dim = mtf.Dimension("rows_size", 7)
@@ -400,7 +411,7 @@ def run_mnist():
         FLAGS.tpu, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
     iterations_per_loop = FLAGS.iterations
     if iterations_per_loop <= 0:
-      iterations_per_loop = FLAGS.data_train_size // FLAGS.batch_size
+      iterations_per_loop = idiv(FLAGS.data_train_size * FLAGS.epochs_between_evals, FLAGS.batch_size, warn=True)
     tf.logging.info("iterations_per_loop=%s" % iterations_per_loop)
     mesh_shape = mtf.convert_to_shape(FLAGS.mesh_shape)
     
@@ -415,9 +426,12 @@ def run_mnist():
         tpu_config=tpu_config.TPUConfig(
             num_shards=mesh_shape.size,
             iterations_per_loop=iterations_per_loop,
-            #num_cores_per_replica=8 // mesh_shape.size,
+            #num_cores_per_replica=idiv(FLAGS.tpu_cores, mesh_shape.size),
             num_cores_per_replica=1,
-            per_host_input_for_training=tpu_config.InputPipelineConfig.BROADCAST))
+            per_host_input_for_training=tpu_config.InputPipelineConfig.BROADCAST,
+            #per_host_input_for_training=tpu_config.InputPipelineConfig.PER_HOST_V2,
+            experimental_host_call_every_n_steps=500,
+            ))
     mnist_classifier = tpu_estimator.TPUEstimator(
         use_tpu=True,
         model_fn=model_fn,
@@ -442,7 +456,7 @@ def run_mnist():
         model_dir=FLAGS.model_dir)
 
   current_step = estimator_lib._load_global_step_from_checkpoint_dir(FLAGS.model_dir)  # pylint: disable=protected-access,line-too-long
-  current_epoch = current_step // iterations_per_loop
+  current_epoch = idiv(current_step, iterations_per_loop, warn=True)
   tf.logging.info('Current step %d epoch %d', current_step, current_epoch)
 
 
@@ -456,14 +470,15 @@ def run_mnist():
     # randomness, while smaller sizes use less memory. MNIST is a small
     # enough dataset that we can easily shuffle the full epoch.
     ds = dataset.train(FLAGS.data_dir)
-    ds_batched = ds.cache().shuffle(buffer_size=50000).batch(batch_size, drop_remainder=True)
-    ds_batched = ds_batched.map(lambda features, labels, batch_size=batch_size: (features.set_shape([batch_size, features.shape[-1]]) or labels.set_shape([batch_size]) or (tf.reshape(features, [batch_size, 4, 7, 4, 7, 1]), labels)))
+    ds_batched = ds.cache().shuffle(buffer_size=50000).batch(batch_size, drop_remainder=True).prefetch(300)
+    #ds_batched = ds.shuffle(buffer_size=256).batch(batch_size, drop_remainder=True)
+    ds_batched = ds_batched.map(lambda features, labels, batch_size=batch_size: (features.set_shape([batch_size, features.shape[-1]]) or labels.set_shape([batch_size]) or (tf.reshape(features, [batch_size, 4, 7, 4, 7, 1]), labels)), num_parallel_calls=300)
     #tf.reshape(image, [FLAGS.batch_size, 4, 7, 4, 7, 1])
 
     # Iterate through the dataset a set number (`epochs_between_evals`) of times
     # during each training session.
-    ds = ds_batched.repeat(FLAGS.epochs_between_evals)
-    #ds = ds_batched.repeat()
+    #ds = ds_batched.repeat(FLAGS.epochs_between_evals)
+    ds = ds_batched.repeat()
     return ds
 
   def eval_input_fn(params=None):
@@ -477,14 +492,14 @@ def run_mnist():
     # import tqdm
     # for epoch in tqdm.trange(FLAGS.train_epochs):
     #if True:
-    for _ in tqdm.trange(current_epoch, FLAGS.train_epochs // FLAGS.epochs_between_evals):
+    for _ in tqdm.trange(current_epoch, idiv(FLAGS.train_epochs, FLAGS.epochs_between_evals, warn=True)):
       # eval_results = mnist_classifier.evaluate(input_fn=eval_input_fn)
       # print("\nEvaluation results:\n\t%s\n" % eval_results)
       #mnist_classifier.train(input_fn=train_input_fn, max_steps=FLAGS.iterations)
       mnist_classifier.train(input_fn=train_input_fn, steps=iterations_per_loop)
   else:
     # Train and evaluate model.
-    for _ in tqdm.trange(current_epoch, FLAGS.train_epochs // FLAGS.epochs_between_evals):
+    for _ in tqdm.trange(current_epoch, idiv(FLAGS.train_epochs, FLAGS.epochs_between_evals, warn=True)):
       mnist_classifier.train(input_fn=train_input_fn, hooks=None)
       eval_results = mnist_classifier.evaluate(input_fn=eval_input_fn)
       print("\nEvaluation results:\n\t%s\n" % eval_results)
@@ -543,6 +558,7 @@ def main(_):
 
 if __name__ == "__main__":
   tf.disable_v2_behavior()
-  tf.logging.set_verbosity(tf.logging.DEBUG)
-  tf.get_logger().setLevel('DEBUG')
+  #tf.logging.set_verbosity(tf.logging.DEBUG)
+  #tf.get_logger().setLevel('DEBUG')
+  tf.get_logger().setLevel('INFO')
   tf.app.run()
