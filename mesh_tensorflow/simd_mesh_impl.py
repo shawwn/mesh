@@ -197,8 +197,8 @@ class SimdMeshImpl(mtf.MeshImpl):
           device = mesh_impl.device_assignment.tpu_device(replica=physical_pnum)
           mem = shape.num_elements() * size
 
-          tf.logging.debug('Place slice variable {} shape={} dtype={} on {} and consumes {} Bytes.'.format(
-            var.name, shape.as_list(), var.dtype, device, mem))
+          tf.logging.debug('Slice on {device} shape={shape} dtype={dtype} consumes {mem:,} bytes: {name}'.format(
+            name=var.name, shape=shape.as_list(), dtype=var.dtype, device=device, mem=mem))
           return var
 
         slices.append(log_info(slice_var))
