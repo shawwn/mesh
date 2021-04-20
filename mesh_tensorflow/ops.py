@@ -5605,7 +5605,7 @@ def pretty_print_counters(counters):
       totals[p] += val
   parts = []
   for name, val in sorted(six.iteritems(totals)):
-    parts.append(" " * name.count("/") + "%s: %.3g" % (name, val))
+    parts.append(" " * name.count("/") + "{}: {:,}".format(name, val)) #"%s: %.3g" % (name, val))
   return "\n".join(parts)
 
 
